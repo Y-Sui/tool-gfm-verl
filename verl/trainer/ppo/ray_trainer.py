@@ -916,6 +916,9 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
 
+        # Bind actor to reference workers for synchronization if enabled
+        self._bind_ref_to_actor()
+
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
@@ -926,6 +929,38 @@ class RayPPOTrainer:
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
+
+    def _bind_ref_to_actor(self):
+        """Bind actor module to reference workers for parameter synchronization.
+
+        This enables the reference model to sync parameters from the actor during training
+        when sync_ref_model is enabled in the configuration.
+        """
+        # Check if reference model sync is enabled
+        sync_enabled = self.config.actor_rollout_ref.ref.get("sync_ref_model", False)
+        if not sync_enabled:
+            return
+
+        # For hybrid engine, bind the actor module from the hybrid worker to itself (for ref role)
+        if self.hybrid_engine:
+            # Get the first worker's actor_module_fsdp as the upstream actor
+            # In Ray, we need to get the remote actor handle and pass it
+            # We'll call ref_bind_actors on each worker in the group
+            worker_handles = self.actor_rollout_wg.worker_handles
+
+            # Call ref_bind_actors on each worker, passing its own actor_module_fsdp
+            for worker_handle in worker_handles:
+                # Each worker will bind its own actor_module_fsdp to its reference model
+                # This works because ActorRolloutRefWorker has both actor and ref in the same process
+                ray.get(
+                    worker_handle.execute_method.remote(
+                        "ref_bind_actors",
+                        # Pass the actor_module_fsdp from the same worker
+                        ray.get(worker_handle.execute_method.remote("__getattribute__", "actor_module_fsdp")),
+                    )
+                )
+
+            print("[Trainer] Bound actor modules to reference workers for synchronization")
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe

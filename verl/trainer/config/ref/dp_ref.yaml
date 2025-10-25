@@ -36,3 +36,16 @@ entropy_from_logits_with_chunking: False
 
 # recompute entropy
 entropy_checkpointing: False
+
+# Reference model synchronization configuration
+# From PR: https://github.com/volcengine/verl/pull/794/files
+# Whether to sync reference model with actor model during training
+sync_ref_model: False
+
+# Number of forward steps between reference model parameter updates
+# Must be > 0 if sync_ref_model is True
+ref_model_sync_steps: 0
+
+# Blending coefficient for EMA-style parameter mixing: target = target * (1 - alpha) + source * alpha
+# Must be in range (0, 1] if sync_ref_model is True
+ref_model_mixup_alpha: 0.0

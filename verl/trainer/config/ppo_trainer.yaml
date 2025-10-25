@@ -19,6 +19,7 @@ defaults:
 
   # Reference model config.
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
+  # Reference model can optionally sync with actor model during training. # PR: https://github.com/volcengine/verl/pull/794/files
   - ref@actor_rollout_ref.ref: dp_ref
 
   # Rollout model config.

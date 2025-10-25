@@ -206,6 +206,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
+        # Initialize reference model synchronization state
+        self._upstream_actor = None
+        self.ref_forward_step = 0
+        if self._is_ref:
+            # Validate sync configuration
+            sync_enabled = self.config.ref.get("sync_ref_model", False)
+            sync_steps = self.config.ref.get("ref_model_sync_steps", 0)
+            mixup_alpha = self.config.ref.get("ref_model_mixup_alpha", 0.0)
+
+            if sync_enabled:
+                assert sync_steps > 0, (
+                    f"ref_model_sync_steps must be > 0 when sync_ref_model is True, got {sync_steps}"
+                )
+                assert 0 < mixup_alpha <= 1.0, (
+                    f"ref_model_mixup_alpha must be in range (0, 1] when sync_ref_model is True, got {mixup_alpha}"
+                )
+
     def _build_model_optimizer(
         self,
         model_path,
@@ -810,6 +827,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
             return data
         assert self._is_ref
+
+        # Check if we need to synchronize reference model from actor
+        sync_enabled = self.config.ref.get("sync_ref_model", False)
+        if sync_enabled:
+            self.ref_forward_step += 1
+            sync_steps = self.config.ref.get("ref_model_sync_steps", 0)
+            if sync_steps > 0 and self.ref_forward_step % sync_steps == 0:
+                self._sync_ref_from_actor()
+
         # else:
         # otherwise, the class have a standalone ref model
         # Support all hardwares
@@ -834,6 +860,64 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.ref_policy.actor_module._handle.reshard(True)
 
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def ref_bind_actors(self, upstream_actor):
+        """Bind upstream actor module to reference worker for synchronization.
+
+        Args:
+            upstream_actor: The actor module to sync parameters from
+        """
+        if not self._is_ref:
+            return
+
+        sync_enabled = self.config.ref.get("sync_ref_model", False)
+        if not sync_enabled:
+            return
+
+        self._upstream_actor = upstream_actor
+        from verl.utils.logger import log_with_rank
+        log_with_rank(
+            f"[rank-{self.rank}]: Bound upstream actor for reference model synchronization",
+            rank=dist.get_rank(),
+            logger=logger,
+            log_only_rank_0=True,
+        )
+
+    def _sync_ref_from_actor(self):
+        """Synchronize reference model parameters from upstream actor using EMA-style mixing.
+
+        Applies the formula: target = target * (1 - alpha) + source * alpha
+        where target is the reference model and source is the actor model.
+        """
+        if self._upstream_actor is None:
+            return
+
+        sync_enabled = self.config.ref.get("sync_ref_model", False)
+        if not sync_enabled:
+            return
+
+        mixup_alpha = self.config.ref.get("ref_model_mixup_alpha", 0.0)
+
+        # Get parameters from both models
+        ref_params = dict(self.ref_module_fsdp.named_parameters())
+        actor_params = dict(self._upstream_actor.named_parameters())
+
+        # Synchronize parameters using EMA
+        with torch.no_grad():
+            for name, ref_param in ref_params.items():
+                if name in actor_params:
+                    actor_param = actor_params[name]
+                    # EMA update: ref = ref * (1 - alpha) + actor * alpha
+                    ref_param.data.mul_(1 - mixup_alpha).add_(actor_param.data, alpha=mixup_alpha)
+
+        from verl.utils.logger import log_with_rank
+        log_with_rank(
+            f"[rank-{self.rank}]: Synchronized reference model from actor (step={self.ref_forward_step}, alpha={mixup_alpha})",
+            rank=dist.get_rank(),
+            logger=logger,
+            log_only_rank_0=True,
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
